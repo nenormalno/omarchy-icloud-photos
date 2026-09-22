@@ -23,6 +23,8 @@ ShellRoot {
     (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy-icloud-photos/config"
 
   property var items: []
+  property var library: []       // full index; items is library narrowed by dateFilter
+  property string dateFilter: "" // "" | YYYY-MM | YYYY-MM-DD
   property var days: []          // [{label, indices: [int]}]
   property int selected: -1
   // OMARCHY_ICLOUD_PHOTOS_TOUR=1: scroll the grid from top to bottom by itself and
@@ -36,6 +38,40 @@ ShellRoot {
   property int anchor: -1
   property bool viewerOpen: false
   property bool helpOpen: false
+  property bool jumpOpen: false
+  property bool demo: false
+  property var pinnedMonths: []
+  property string historySince: ""
+  property int olderChain: 0
+  property real olderChainAdded: 0
+  // Set while a date jump is downloading a month; consumed when the index reloads.
+  property string pendingJump: ""
+  // Scrolling past the top fetches the next older stretch. The base keeps the
+  // photos you were looking at in place while that stretch is prepended.
+  property bool loadingOlder: false
+  // Spinner in the top slot, kept up for the whole week chain.
+  property bool showOlderSpinner: false
+  // One older-week fetch at a time. Scrolling away (down) rearms the next one,
+  // so moving back and forth does not stack loads.
+  property bool olderActive: false
+  property bool olderPull: true
+  property real olderDown: 0
+  property real olderBarY: -1
+  property bool olderLatch: false
+  property real olderBaseY: 0
+  property real olderBaseH: -1
+  property var fetchQueue: []
+  property int fetchAt: 0
+  property var fetchAction: null
+  property string afterFetchId: ""
+  property string fetchFailedId: ""
+  property bool fetching: false
+  // Id of the item whose original is downloading, so the viewer can spin
+  // on that thumbnail without waiting to open.
+  property string fetchingId: ""
+  // Files from the original just downloaded, applied even if a reindex is
+  // blocked by the week sync still holding the lock.
+  property var pendingOriginal: null
   // Details panel in the viewer (`i`): rows for the item it was fetched for.
   property bool infoOpen: false
   property var infoRows: []
@@ -53,6 +89,7 @@ ShellRoot {
   // root.tour, not tour: the animation below has id `tour`, and an id wins
   // from a property in the same scope.
   property bool pinBottom: !root.tour   // the tour starts at the top and scrolls down
+  property bool ctrlHeld: false
   // True while the grid is being rebuilt, so a re-created selected thumb
   // does not yank the view towards itself before the layout has settled.
   property bool suppressReveal: false
@@ -146,7 +183,12 @@ ShellRoot {
     path: root.configPath
     watchChanges: true
     printErrors: false
-    onLoaded: { root.appleId = root.parseAppleId(text()); root.rangeDays = root.parseDays(text()); root.configLoaded = true; }
+    onLoaded: {
+      root.appleId = root.parseAppleId(text());
+      root.rangeDays = root.parseDays(text());
+      root.demo = /^\s*DEMO=["']?1/m.test(String(text()));
+      root.configLoaded = true;
+    }
     onLoadFailed: { root.appleId = ""; root.configLoaded = true; }
     onFileChanged: reload()
   }
@@ -171,6 +213,24 @@ ShellRoot {
   }
 
   FileView {
+    id: rangesFile
+    path: root.cacheDir + "/ranges.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text());
+        root.pinnedMonths = parsed.months || [];
+        root.historySince = parsed.since || "";
+      } catch (e) {
+        root.pinnedMonths = [];
+        root.historySince = "";
+      }
+    }
+    onFileChanged: reload()
+  }
+
+  FileView {
     id: statusFile
     path: root.cacheDir + "/status.json"
     watchChanges: true
@@ -185,7 +245,73 @@ ShellRoot {
     id: sync
     command: [root.syncScript]
     running: false
-    onExited: { indexFile.reload(); statusFile.reload(); }
+    onExited: (code, status) => {
+      root.traceLine("sync exited code=" + code + " status=" + status
+        + (root.loadingOlder ? " (older week)" : ""));
+      sync.command = [root.syncScript];
+      indexFile.reload();
+      statusFile.reload();
+      rangesFile.reload();
+      if (root.pendingJump) jumpFallback.restart();
+      if (root.loadingOlder) olderDone.restart();
+    }
+  }
+
+  // ui.log, next to sync.log. One long-lived writer so a line cannot be lost
+  // between process starts.
+  Process {
+    id: uiLog
+    stdinEnabled: true
+    command: ["bash", "-c", "umask 077; mkdir -p -- \"$1\"; touch \"$1/ui.log\"; exec cat >> \"$1/ui.log\"", "log", root.cacheDir]
+    running: true
+  }
+
+  function traceLine(msg) {
+    var line = Qt.formatDateTime(new Date(), "yyyy-MM-dd HH:mm:ss") + " " + msg + "\n";
+    console.log(msg);
+    if (uiLog.running) uiLog.write(line);
+  }
+
+  Timer {
+    id: olderDone
+    interval: 1500
+    onTriggered: {
+      var added = root.olderBaseH >= 0 ? Math.max(0, grid.contentHeight - root.olderBaseH) : 0;
+      root.olderChainAdded += added;
+      root.olderChain++;
+      root.loadingOlder = false;
+      root.olderBaseH = -1;
+      root.olderLatch = false;
+      if (toast.busy) toast.opacity = 0;
+      // Keep a screen of older photos buffered. A short or empty week
+      // pulls the next one; four weeks is the most one gesture will fetch.
+      var more = root.olderChain < 4 && root.olderChainAdded < grid.height * 0.85;
+      if (!more || !root.maybeLoadOlder(true)) {
+        root.showOlderSpinner = false;
+        root.olderActive = false;
+      }
+    }
+  }
+
+  Timer {
+    id: jumpFallback
+    interval: 500
+    onTriggered: {
+      if (!root.pendingJump) return;
+      var want = root.pendingJump;
+      root.pendingJump = "";
+      root.finishJump(want);
+    }
+  }
+
+  Process {
+    id: fetcher
+    running: false
+    property string output: ""
+    stdout: StdioCollector {
+      onStreamFinished: fetcher.output = text
+    }
+    onExited: root.fetchExited(fetcher.output)
   }
 
   Process { id: opener }
@@ -227,7 +353,10 @@ ShellRoot {
     id: reindex
     command: [root.syncScript, "--index-only"]
     running: false
-    onExited: if (root.reindexDirty) { root.reindexDirty = false; running = true; }
+    onExited: {
+      if (root.reindexDirty) { root.reindexDirty = false; running = true; return; }
+      if (root.fetchAction) indexFile.reload();
+    }
   }
 
   Process {
@@ -268,10 +397,14 @@ ShellRoot {
     var list;
     try { list = JSON.parse(raw); } catch (e) { return; }
     if (!Array.isArray(list)) return;
+    library = list;
     var keepId = current ? current.id : null;
-    var idx = -1;
-    if (keepId) for (var j = 0; j < list.length; j++) if (list[j].id === keepId) { idx = j; break; }
-    rebuild(list, idx >= 0 ? idx : list.length - 1);
+    if (root.pendingJump) {
+      var want = root.pendingJump;
+      root.pendingJump = "";
+      root.finishJump(want);
+    } else root.showFiltered(keepId);
+    if (root.fetchAction && root.afterFetchId) root.finishFetch();
   }
 
   function groupDays(list) {
@@ -306,11 +439,233 @@ ShellRoot {
 
   function rangeLabel() {
     var d = rangeDays;
-    if (d === 7) return "last week";
-    if (d === 14) return "last two weeks";
-    if (d >= 28 && d <= 31) return "last month";
-    if (d >= 89 && d <= 93) return "last three months";
-    return "last " + d + " days";
+    var base;
+    if (d === 7) base = "last week";
+    else if (d === 14) base = "last two weeks";
+    else if (d >= 28 && d <= 31) base = "last month";
+    else if (d >= 89 && d <= 93) base = "last three months";
+    else base = "last " + d + " days";
+    if (historySince) {
+      var since = parseIso(historySince);
+      var cutoff = new Date();
+      cutoff.setHours(0, 0, 0, 0);
+      cutoff.setDate(cutoff.getDate() - rangeDays);
+      if (since < cutoff)
+        return "since " + since.toLocaleDateString(Qt.locale("en_GB"), "d MMM");
+    }
+    return base;
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function parseIso(s) {
+    var p = String(s).split("-");
+    return new Date(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10));
+  }
+
+  function isoDate(d) {
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  }
+
+  function weekTitle(from, to) {
+    var a = parseIso(from), b = parseIso(to);
+    var mon = b.toLocaleDateString(Qt.locale("en_GB"), "MMM");
+    if (a.getMonth() === b.getMonth() && a.getFullYear() === b.getFullYear())
+      return a.getDate() + "–" + b.getDate() + " " + mon;
+    return a.toLocaleDateString(Qt.locale("en_GB"), "d MMM") + " – " + b.toLocaleDateString(Qt.locale("en_GB"), "d MMM");
+  }
+
+  // The seven days immediately before the oldest day already requested.
+  function olderRange() {
+    if (items.length === 0) return null;
+    var boundary = items[0].date;
+    if (historySince && historySince < boundary) boundary = historySince;
+    var edge = parseIso(boundary);
+    if (isNaN(edge.getTime())) return null;
+    var end = new Date(edge.getFullYear(), edge.getMonth(), edge.getDate() - 1);
+    var start = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 6);
+    return { from: isoDate(start), to: isoDate(end) };
+  }
+
+  function noteOlderDown(px) {
+    if (px <= 0) return;
+    olderDown = Math.min(400, olderDown + px);
+    if (olderDown >= 120) olderPull = true;
+  }
+
+  function maybeLoadOlder(chained) {
+    if (demo || needLogin || viewerOpen || jumpOpen || helpOpen || dateFilter) return false;
+    // A scroll up starts one chain. Further ups do nothing until the user
+    // has scrolled down and this chain has finished.
+    if (!chained && (olderActive || !olderPull)) return false;
+    if (loadingOlder || sync.running || olderLatch || items.length === 0) return false;
+    var range = olderRange();
+    if (!range) return false;
+    if (!chained) {
+      olderChain = 0;
+      olderChainAdded = 0;
+      olderPull = false;
+      olderDown = 0;
+      olderActive = true;
+    }
+    pinBottom = false;
+    grid.restoreY = -1;
+    showOlderSpinner = true;
+    olderLatch = true;
+    loadingOlder = true;
+    olderBaseY = grid.contentY;
+    olderBaseH = grid.contentHeight;
+    toast.showBusy("Loading " + weekTitle(range.from, range.to) + "…");
+    traceLine((chained ? "older week (chain) " : "older week ") + range.from + " .. " + range.to);
+    startSync(range.from, range.to);
+    return true;
+  }
+
+  function indexOfDate(date) {
+    var source = sourceItems();
+    for (var i = 0; i < source.length; i++) if (source[i].date === date) return i;
+    return -1;
+  }
+
+  function firstInMonth(month) {
+    var source = sourceItems();
+    for (var i = 0; i < source.length; i++) if (String(source[i].date).indexOf(month) === 0) return i;
+    return -1;
+  }
+
+  function nearestInMonth(month, date) {
+    var source = sourceItems();
+    var target = Date.parse(date);
+    var best = -1, bestDiff = 1e15;
+    for (var i = 0; i < source.length; i++) {
+      if (String(source[i].date).indexOf(month) !== 0) continue;
+      var diff = Math.abs(Date.parse(source[i].date) - target);
+      if (diff < bestDiff) { bestDiff = diff; best = i; }
+    }
+    return best;
+  }
+
+  function monthPinned(month) {
+    for (var i = 0; i < pinnedMonths.length; i++) if (pinnedMonths[i] === month) return true;
+    return false;
+  }
+
+  function monthBounds(text) {
+    var m = text.slice(0, 7);
+    var parts = m.split("-");
+    var y = parseInt(parts[0], 10), mo = parseInt(parts[1], 10);
+    var last = new Date(y, mo, 0).getDate();
+    return {
+      month: m,
+      from: m + "-01",
+      to: m + "-" + (last < 10 ? "0" : "") + last,
+      day: text.length >= 10 ? text.slice(0, 10) : ""
+    };
+  }
+
+  function sourceItems() { return library.length ? library : items; }
+
+  function dayChoices() {
+    var source = sourceItems();
+    var out = [];
+    var seen = {};
+    for (var i = source.length - 1; i >= 0; i--) {
+      var d = source[i].date;
+      if (!d || seen[d]) continue;
+      seen[d] = true;
+      out.push({ label: dayLabel(source[i]), date: d });
+    }
+    return out;
+  }
+
+  function filterLabel() {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateFilter)) {
+      var d = parseIso(dateFilter);
+      return d.toLocaleDateString(Qt.locale("en_GB"), "d MMMM yyyy");
+    }
+    if (/^\d{4}-\d{2}$/.test(dateFilter)) {
+      var p = dateFilter.split("-");
+      var month = new Date(parseInt(p[0], 10), parseInt(p[1], 10) - 1, 1);
+      var s = month.toLocaleDateString(Qt.locale("en_GB"), "MMMM yyyy");
+      return s.charAt(0).toUpperCase() + s.slice(1);
+    }
+    return dateFilter;
+  }
+
+  // Narrow the grid to a day (YYYY-MM-DD) or a month (YYYY-MM). An empty
+  // filter shows the whole loaded library again.
+  function setDateFilter(filter) {
+    dateFilter = filter || "";
+    clearChecked();
+    pinBottom = dateFilter === "";
+    showFiltered(null);
+    if (dateFilter) grid.contentY = 0;
+  }
+
+  function showFiltered(keepId) {
+    var source = library;
+    var list = [];
+    for (var i = 0; i < source.length; i++)
+      if (!dateFilter || String(source[i].date).indexOf(dateFilter) === 0) list.push(source[i]);
+    var idx = list.length ? list.length - 1 : -1;
+    if (keepId) for (var j = 0; j < list.length; j++) if (list[j].id === keepId) { idx = j; break; }
+    rebuild(list, idx);
+  }
+
+  function finishJump(want) {
+    if (indexOfDate(want) >= 0) { setDateFilter(String(want).length >= 10 ? want : String(want).slice(0, 7)); return; }
+    var month = String(want).slice(0, 7);
+    if (firstInMonth(month) < 0) { toast.show("No photos in " + month, 2500); return; }
+    if (String(want).length >= 10) {
+      var idx = nearestInMonth(month, want);
+      toast.show("No photos on " + want, 2500);
+      if (idx >= 0) setDateFilter(sourceItems()[idx].date);
+      return;
+    }
+    setDateFilter(month);
+  }
+
+  function pickDay(date) {
+    jumpOpen = false;
+    if (indexOfDate(date) >= 0) setDateFilter(date);
+  }
+
+  function goToDate(text) {
+    var raw = String(text || "").trim();
+    // A partial prefix (2026, 2026-09, 2026-09-2) filters what is already loaded.
+    if (!/^\d{4}-\d{2}(-\d{2})?$/.test(raw)) {
+      if (/^\d{4}(-\d{0,2}(-\d{0,2})?)?$/.test(raw)) {
+        var source = sourceItems();
+        for (var i = 0; i < source.length; i++) {
+          if (String(source[i].date).indexOf(raw) === 0) {
+            jumpOpen = false;
+            setDateFilter(raw);
+            return;
+          }
+        }
+      }
+      toast.show("No photos match " + raw, 2500);
+      return;
+    }
+    var b = monthBounds(raw);
+    jumpOpen = false;
+    if (b.day && indexOfDate(b.day) >= 0) { setDateFilter(b.day); return; }
+    var inMonth = firstInMonth(b.month);
+    if (inMonth >= 0 || monthPinned(b.month)) {
+      if (inMonth < 0) { toast.show("No photos in " + b.month, 2500); return; }
+      if (b.day) {
+        toast.show("No photos on " + b.day, 2500);
+        var idx = nearestInMonth(b.month, b.day);
+        if (idx >= 0) setDateFilter(sourceItems()[idx].date);
+        return;
+      }
+      setDateFilter(b.month);
+      return;
+    }
+    if (demo) { toast.show("The demo library does not reach iCloud", 3000); return; }
+    if (sync.running) { toast.show("A sync is already running", 2500); return; }
+    pendingJump = b.day || b.from;
+    startSync(b.from, b.to);
   }
 
   function parseAppleId(raw) {
@@ -394,11 +749,28 @@ ShellRoot {
 
   function openCurrent() {
     if (!current) return;
-    opener.command = ["xdg-open", current.kind === "video" ? current.video : current.path];
-    opener.running = true;
+    withOriginals(targets(), function () {
+      if (!root.current) return;
+      opener.command = ["xdg-open", root.current.kind === "video" ? root.current.video : root.current.path];
+      opener.running = true;
+    });
+  }
+
+  function openViewer() {
+    if (!current) return;
+    traceLine("open " + current.name + " needsOriginal=" + current.needsOriginal
+      + " record=" + (current.record ? "yes" : "no"));
+    viewerOpen = true;
+    keys.forceActiveFocus();
+    if (current.needsOriginal && current.id !== fetchFailedId)
+      withOriginals([current], function () {});
   }
 
   function copyCurrent() {
+    withOriginals(targets(), function () { root.copyCurrentNow(); });
+  }
+
+  function copyCurrentNow() {
     var list = targets();
     if (list.length === 0) return;
     if (list.length > 1) {
@@ -422,6 +794,10 @@ ShellRoot {
   // remuxed to MP4 without re-encoding, JPEG and PNG are copied as they are.
   // Never overwrites: a taken name gets a numbered suffix.
   function saveToDownloads() {
+    withOriginals(targets(), function () { root.saveToDownloadsNow(); });
+  }
+
+  function saveToDownloadsNow() {
     var list = targets();
     if (list.length === 0) return;
     var args = [];
@@ -452,6 +828,11 @@ ShellRoot {
   // a full-size JPEG in the cache, since the shell cannot decode HEIC.
   function setWallpaper() {
     if (!current || current.kind === "video") return;
+    withOriginals([current], function () { root.setWallpaperNow(); });
+  }
+
+  function setWallpaperNow() {
+    if (!current || current.kind === "video") return;
     var it = current;
     wallpaper.command = ["bash", "-c", '
       src="$1"; cache="$2"; key="$3"
@@ -481,10 +862,21 @@ ShellRoot {
     infoProc.running = true;
   }
 
-  onCurrentChanged: if (infoOpen && viewerOpen) fetchInfo()
-  onViewerOpenChanged: if (!viewerOpen) infoOpen = false
+  onCurrentChanged: {
+    if (infoOpen && viewerOpen) fetchInfo();
+    if (viewerOpen && current && current.needsOriginal && !fetching && current.id !== fetchFailedId) openViewer();
+  }
+  onViewerOpenChanged: {
+    if (!viewerOpen) infoOpen = false;
+    keys.forceActiveFocus();
+  }
+  onJumpOpenChanged: if (!jumpOpen) keys.forceActiveFocus()
 
   function copyPath() {
+    withOriginals(targets(), function () { root.copyPathNow(); });
+  }
+
+  function copyPathNow() {
     var list = targets();
     if (list.length === 0) return;
     var paths = list.map(function (it) { return it.path; });
@@ -493,16 +885,143 @@ ShellRoot {
     toast.show(list.length === 1 ? "Copied " + paths[0] : "Copied " + list.length + " paths");
   }
 
-  function startSync() {
-    if (sync.running) return;
+  function startSync(from, to) {
+    if (sync.running) { traceLine("sync skipped, one is already running"); return; }
+    if (from && to) {
+      traceLine("sync " + from + " .. " + to);
+      sync.command = [root.syncScript, "--from", from, "--to", to];
+    } else {
+      traceLine("sync rolling");
+      sync.command = [root.syncScript];
+    }
     sync.running = true;
   }
 
+  // Download originals for any thumb-only items, then run action once the
+  // index points at the files that landed.
+  function withOriginals(list, action) {
+    var need = [];
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].needsOriginal) need.push(list[i]);
+    if (need.length === 0) { action(); return; }
+    if (fetching) return;
+    for (var j = 0; j < need.length; j++) {
+      if (!need[j].record) {
+        toast.show("No iCloud id for " + need[j].name + " yet. Press r to sync, then try again.", 4000);
+        return;
+      }
+    }
+    fetching = true;
+    fetchQueue = need;
+    fetchAt = 0;
+    fetchAction = action;
+    runFetch();
+  }
+
+  function rememberOriginal(id, files) {
+    function apply(list) {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        if (!list[i] || list[i].id !== id) { out.push(list[i]); continue; }
+        var it = Object.assign({}, list[i]);
+        var still = "", movie = "";
+        for (var f = 0; f < files.length; f++) {
+          if (/\.(mov|mp4|m4v)$/i.test(files[f])) movie = files[f];
+          else still = files[f];
+        }
+        if (still) it.path = still;
+        if (movie && (it.kind === "video" || it.kind === "live")) {
+          it.video = movie;
+          if (it.kind === "video") it.path = movie;
+        }
+        if (still && /\.(jpe?g|png|webp|gif)$/i.test(still)) it.preview = still;
+        it.needsOriginal = false;
+        out.push(it);
+      }
+      return out;
+    }
+    library = apply(library);
+    items = apply(items);
+  }
+
+  function runFetch() {
+    var it = fetchQueue[fetchAt];
+    var dest = it.path.substring(0, it.path.lastIndexOf("/"));
+    fetcher.output = "";
+    fetcher.command = [root.helperScript, "fetch", "--record", it.record,
+      "--library", it.library || "PrimarySync", "--dest", dest, "--ts", String(it.ts)];
+    fetchingId = it.id;
+    if (!viewerOpen) toast.showBusy("Downloading " + it.name + "…");
+    fetcher.running = true;
+  }
+
+  function fetchExited(out) {
+    var res = null;
+    var lines = String(out || "").trim().split("\n");
+    try { res = JSON.parse(lines[lines.length - 1]); } catch (e) {}
+    if (!(res && res.ok)) {
+      var failed = fetchQueue[fetchAt];
+      fetching = false;
+      fetchingId = "";
+      fetchAction = null;
+      fetchQueue = [];
+      fetchFailedId = failed ? failed.id : "";
+      traceLine("fetch failed" + (failed ? " " + failed.name : "") + ": " + ((res && res.error) || "no answer"));
+      toast.show((res && res.error) || "Could not download the original", 5000);
+      return;
+    }
+    fetchAt++;
+    var doneId = fetchQueue[fetchAt - 1] ? fetchQueue[fetchAt - 1].id : "";
+    if (doneId && res.files) {
+      pendingOriginal = { id: doneId, files: res.files };
+      rememberOriginal(doneId, res.files);
+      traceLine("fetch ok " + (res.files.length || 0) + " file(s)");
+    }
+    if (fetchAt < fetchQueue.length) {
+      runFetch();
+      return;
+    }
+    afterFetchId = fetchQueue[0].id;
+    fetchQueue = [];
+    if (reindex.running) reindexDirty = true;
+    else reindex.running = true;
+  }
+
+  function finishFetch() {
+    var action = fetchAction;
+    var id = afterFetchId;
+    var pending = pendingOriginal;
+    fetchAction = null;
+    afterFetchId = "";
+    pendingOriginal = null;
+    fetching = false;
+    fetchingId = "";
+    // applyIndex just reloaded whatever is on disk. Put the file we just
+    // downloaded back on the open item if that reload has not caught up.
+    if (pending && pending.id) rememberOriginal(pending.id, pending.files || []);
+    var found = -1;
+    for (var i = 0; i < items.length; i++) if (items[i].id === id) { found = i; break; }
+    if (found >= 0) selected = found;
+    if (found < 0) {
+      traceLine("fetch finished but " + id + " is not in the grid");
+      toast.show("Downloaded, but the original is not in the grid yet", 4000);
+      return;
+    }
+    fetchFailedId = "";
+    if (toast.busy) toast.opacity = 0;
+    if (action) action();
+  }
+
   function setCell(v) {
-    v = Math.round(v);
+    v = Math.max(100, Math.min(400, Math.round(v)));
     if (v === settings.cell) return;
+    // Remember where we were in the grid so resizing does not scroll.
+    if (grid.zoomAnchor < 0) {
+      var span = grid.contentHeight - grid.height;
+      grid.zoomAnchor = span > 1 ? grid.contentY / span : 0;
+    }
     settings.cell = v;
     settingsFile.writeAdapter();
+    grid.zoomHold.restart();
   }
 
   function askDelete() {
@@ -565,6 +1084,8 @@ ShellRoot {
     if (job.action === "delete") {
       var cmd = [root.helperScript, "delete", "--key", it.id, "--file", it.path, "--ts", String(it.ts)];
       if (it.kind === "live" && it.video) cmd.push("--companion", it.video);
+      if (it.record) cmd.push("--record", it.record);
+      if (it.library) cmd.push("--library", it.library);
       if (it.shared) cmd.push("--shared");
       trash.command = cmd;
       toast.showBusy(batchTotal > 1 ? "Deleting " + (batchDone + 1) + " of " + batchTotal + "…" : "Deleting " + it.name + "…");
@@ -613,6 +1134,9 @@ ShellRoot {
   }
 
   function removeItem(id) {
+    var lib = library.slice();
+    for (var n = 0; n < lib.length; n++) if (lib[n].id === id) { lib.splice(n, 1); break; }
+    library = lib;
     var list = items.slice();
     var idx = -1;
     for (var i = 0; i < list.length; i++) if (list[i].id === id) { idx = i; break; }
@@ -623,6 +1147,12 @@ ShellRoot {
   }
 
   function insertItem(it) {
+    var lib = library.slice();
+    var libPos = lib.length;
+    for (var n = 0; n < lib.length; n++) if (lib[n].ts > it.ts) { libPos = n; break; }
+    lib.splice(libPos, 0, it);
+    library = lib;
+    if (dateFilter && String(it.date).indexOf(dateFilter) !== 0) return;
     var list = items.slice();
     var pos = list.length;
     for (var i = 0; i < list.length; i++) if (list[i].ts > it.ts) { pos = i; break; }
@@ -636,7 +1166,7 @@ ShellRoot {
   function rebuild(list, sel) {
     var y = grid.contentY;
     suppressReveal = true;
-    grid.restoreY = pinBottom ? -1 : y;
+    grid.restoreY = (loadingOlder || pinBottom) ? -1 : y;
     items = list;
     days = groupDays(list);
     selected = list.length > 0 ? Math.max(0, Math.min(sel, list.length - 1)) : -1;
@@ -646,7 +1176,11 @@ ShellRoot {
       for (var i = 0; i < list.length; i++) if (checked[list[i].id]) map[list[i].id] = true;
       setChecked(map);
     }
-    if (pinBottom) grid.scrollToBottom(); else grid.contentY = grid.clampY(y);
+    if (loadingOlder) {
+      // Content height catches up after the delegates land; that handler
+      // shifts contentY by however much was prepended.
+    } else if (pinBottom) grid.scrollToBottom();
+    else grid.contentY = grid.clampY(y);
     settleTimer.restart();
   }
 
@@ -722,13 +1256,31 @@ ShellRoot {
       anchors.fill: parent
       focus: true
       Component.onCompleted: forceActiveFocus()
+      // While the date field is up, it sees the key first. Anything it does
+      // not take (arrows, shortcuts) stops here so the grid stays put.
+      Keys.forwardTo: root.jumpOpen ? [jumpOverlay.input] : []
 
+      Keys.onReleased: event => { if (event.key === Qt.Key_Control) root.ctrlHeld = false; }
       Keys.onPressed: event => {
         var k = event.key;
         var t = event.text;
+        if (k === Qt.Key_Control) { root.ctrlHeld = true; return; }
         if (root.needLogin) return;
+        // The open photo wins over the grid, including when another field
+        // still thinks it has the keyboard.
+        if (root.viewerOpen && (k === Qt.Key_Escape || k === Qt.Key_Backspace)) {
+          root.viewerOpen = false;
+          keys.forceActiveFocus();
+          event.accepted = true;
+          return;
+        }
         if (root.helpOpen) {
           if (t === "?" || k === Qt.Key_Escape || t === "q") root.helpOpen = false;
+          event.accepted = true;
+          return;
+        }
+        if (root.jumpOpen) {
+          if (k === Qt.Key_Escape) root.jumpOpen = false;
           event.accepted = true;
           return;
         }
@@ -769,14 +1321,25 @@ ShellRoot {
           return;
         }
         if (t === "q") Qt.quit()
-        else if (k === Qt.Key_Escape) { if (root.checkedCount > 0) root.clearChecked(); else Qt.quit(); }
+        else if (k === Qt.Key_Escape) { if (root.checkedCount > 0) root.clearChecked(); else if (root.dateFilter) root.setDateFilter(""); }
         else if (k === Qt.Key_Left || k === Qt.Key_H) root.move(-1, shift)
         else if (k === Qt.Key_Right || k === Qt.Key_L) root.move(1, shift)
-        else if (k === Qt.Key_Down || k === Qt.Key_J) root.move(grid.columns, shift)
-        else if (k === Qt.Key_Up || k === Qt.Key_K) root.move(-grid.columns, shift)
+        else if (k === Qt.Key_Down || k === Qt.Key_J) { root.noteOlderDown(root.cell); root.move(grid.columns, shift); }
+        else if (k === Qt.Key_Up || k === Qt.Key_K) {
+          var rowAtStart = root.selected === 0;
+          root.move(-grid.columns, shift);
+          if (rowAtStart && root.selected === 0 && !shift) root.maybeLoadOlder();
+        }
+        else if (k === Qt.Key_PageDown) { root.noteOlderDown(grid.height); root.move(grid.pageStep(), shift); }
+        else if (k === Qt.Key_PageUp) {
+          var pageAtStart = root.selected === 0;
+          root.move(-grid.pageStep(), shift);
+          if (pageAtStart && root.selected === 0) root.maybeLoadOlder();
+        }
         else if (t === "g") { root.jumpTo(root.items.length > 0 ? 0 : -1, false); }
         else if (t === "G") { root.jumpTo(root.items.length - 1, false); root.pinBottom = true; grid.scrollToBottom(); }
-        else if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space) { if (root.current) root.viewerOpen = true; }
+        else if (t === "/") { root.jumpOpen = true; }
+        else if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space) { if (root.current) root.openViewer(); }
         else if (t === "o") root.openCurrent()
         else if (t === "y") root.copyCurrent()
         else if (t === "Y") root.copyPath()
@@ -810,14 +1373,32 @@ ShellRoot {
           }
           Text {
             anchors.baseline: parent.children[0].baseline
-            text: root.rangeLabel()
-            color: appTheme.foreground
+            text: root.dateFilter ? root.filterLabel() : root.rangeLabel()
+            color: root.dateFilter ? appTheme.accent : appTheme.foreground
             font.family: appTheme.fontFamily
             font.pixelSize: appTheme.fontSize
           }
           Text {
             anchors.baseline: parent.children[0].baseline
-            text: root.items.length > 0 ? root.items.length + " items" : ""
+            visible: root.dateFilter !== ""
+            text: "esc shows all"
+            color: filterClear.containsMouse ? appTheme.brightForeground : appTheme.darkForeground
+            font.family: appTheme.fontFamily
+            font.pixelSize: appTheme.fontSize
+            MouseArea {
+              id: filterClear
+              anchors.fill: parent
+              anchors.margins: -4
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.setDateFilter("")
+            }
+          }
+          Text {
+            anchors.baseline: parent.children[0].baseline
+            text: root.dateFilter && root.library.length
+                  ? root.items.length + " of " + root.library.length
+                  : (root.items.length > 0 ? root.items.length + " items" : "")
             color: appTheme.darkForeground
             font.family: appTheme.fontFamily
             font.pixelSize: appTheme.fontSize
@@ -894,39 +1475,91 @@ ShellRoot {
         contentWidth: width
         contentHeight: column.implicitHeight + 32
         boundsBehavior: Flickable.StopAtBounds
-
-        // Flickable turns wheel ticks into flicks with inertia, which feels
-        // like scrolling through syrup. Move the content directly instead:
-        // pixel deltas from a touchpad as they come, one wheel notch as a
-        // fixed step. Dragging with a finger still flicks.
+        // Dragging the grid used to pan and flick. Wheel and touchpad still
+        // scroll, by moving the content directly so there is no inertia.
+        interactive: false
+        ScrollBar.vertical: ScrollBar {
+          id: gridBar
+          policy: ScrollBar.AlwaysOn
+          visible: grid.contentHeight > grid.height + 1
+          width: 10
+          contentItem: Rectangle {
+            implicitWidth: 6
+            radius: 3
+            color: gridBar.pressed ? appTheme.brightForeground : appTheme.muted
+          }
+          background: Item { implicitWidth: 8 }
+          onPressedChanged: {
+            if (pressed) { root.pinBottom = false; root.olderBarY = grid.contentY; }
+          }
+          onPositionChanged: {
+            if (!pressed) return;
+            var y = grid.contentY;
+            if (root.olderBarY >= 0 && y > root.olderBarY) root.noteOlderDown(y - root.olderBarY);
+            root.olderBarY = y;
+            if (y < grid.height) root.maybeLoadOlder();
+          }
+        }
         WheelHandler {
           acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+          blocking: true
           onWheel: event => {
+            var ctrl = root.ctrlHeld || (event.modifiers & Qt.ControlModifier) !== 0;
+            if (ctrl) {
+              var steps = event.angleDelta.y !== 0 ? event.angleDelta.y / 120 : event.pixelDelta.y / 40;
+              if (steps !== 0) root.setCell(root.cell + steps * 16);
+              event.accepted = true;
+              return;
+            }
             var dy = event.pixelDelta.y !== 0 ? event.pixelDelta.y : event.angleDelta.y / 120 * 140;
-            grid.contentY = Math.max(0, Math.min(grid.contentHeight - grid.height, grid.contentY - dy));
+            var next = grid.contentY - dy;
+            // dy > 0 scrolls toward older photos. A downward move rearms
+            // the next fetch; ups while one is running are ignored.
+            if (dy < 0) root.noteOlderDown(-dy);
+            else if (dy > 0 && next < grid.height) root.maybeLoadOlder();
+            grid.contentY = Math.max(0, Math.min(grid.contentHeight - grid.height, next));
             root.pinBottom = false;
             event.accepted = true;
           }
         }
 
         readonly property int columns: Math.max(1, Math.floor((width - 40 + root.gap) / (root.cell + root.gap)))
+        function pageStep() {
+          var rows = Math.max(1, Math.floor(height / (root.cell + root.gap)));
+          return rows * columns;
+        }
 
         // Scroll position to hold while a rebuild changes the content height.
         property real restoreY: -1
+        // Fraction of the scroll range to hold while thumbnails are resizing.
+        property real zoomAnchor: -1
+        Timer {
+          id: zoomHold
+          interval: 150
+          onTriggered: grid.zoomAnchor = -1
+        }
 
         function clampY(y) { return Math.max(0, Math.min(contentHeight - height, y)); }
         function scrollToBottom() {
           contentY = Math.max(0, contentHeight - height);
         }
         onContentHeightChanged: {
-          if (root.pinBottom) scrollToBottom();
+          if (zoomAnchor >= 0) {
+            contentY = clampY(zoomAnchor * Math.max(0, contentHeight - height));
+            zoomHold.restart();
+            return;
+          }
+          if (root.loadingOlder && root.olderBaseH >= 0) {
+            var added = contentHeight - root.olderBaseH;
+            contentY = clampY(root.olderBaseY + Math.max(0, added));
+          } else if (root.pinBottom) scrollToBottom();
           else if (restoreY >= 0) contentY = clampY(restoreY);
         }
         onHeightChanged: if (root.pinBottom) scrollToBottom()
         onMovementStarted: root.pinBottom = false
 
         function reveal(thumb) {
-          if (root.pinBottom || root.suppressReveal) return;
+          if (root.pinBottom || root.suppressReveal || root.loadingOlder || zoomAnchor >= 0) return;
           var p = thumb.mapToItem(grid.contentItem, 0, 0);
           var top = p.y - 44;      // keep the day label in view when moving up
           var bottom = p.y + thumb.height + 16;
@@ -941,6 +1574,28 @@ ShellRoot {
           width: grid.width - 40
           spacing: 22
 
+          // Reserved so the spinner can appear above the oldest day without
+          // shifting the grid when a week starts or finishes loading.
+          Item {
+            width: parent.width
+            height: 36
+            Text {
+              anchors.centerIn: parent
+              visible: root.showOlderSpinner
+              text: "\uf110"
+              color: appTheme.accent
+              font.family: appTheme.fontFamily
+              font.pixelSize: 18
+              RotationAnimation on rotation {
+                running: root.showOlderSpinner
+                loops: Animation.Infinite
+                from: 0
+                to: 360
+                duration: 900
+              }
+            }
+          }
+
           Repeater {
             model: root.days
             delegate: Column {
@@ -948,19 +1603,35 @@ ShellRoot {
               width: column.width
               spacing: 10
 
-              Text {
-                text: modelData.label + "  "
-                color: appTheme.brightForeground
-                font.family: appTheme.fontFamily
-                font.pixelSize: appTheme.fontSize + 1
-                font.bold: true
-                Text {
-                  anchors.left: parent.right
-                  anchors.baseline: parent.baseline
-                  text: modelData.indices.length
-                  color: appTheme.darkForeground
-                  font.family: appTheme.fontFamily
-                  font.pixelSize: appTheme.fontSize
+              Item {
+                width: dayRow.implicitWidth
+                height: dayRow.implicitHeight
+                Row {
+                  id: dayRow
+                  spacing: 8
+                  Text {
+                    id: dayTitle
+                    text: modelData.label
+                    color: dayHit.containsMouse ? appTheme.accent : appTheme.brightForeground
+                    font.family: appTheme.fontFamily
+                    font.pixelSize: appTheme.fontSize + 1
+                    font.bold: true
+                  }
+                  Text {
+                    anchors.baseline: dayTitle.baseline
+                    text: modelData.indices.length
+                    color: appTheme.darkForeground
+                    font.family: appTheme.fontFamily
+                    font.pixelSize: appTheme.fontSize
+                  }
+                }
+                MouseArea {
+                  id: dayHit
+                  anchors.fill: parent
+                  anchors.margins: -6
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.jumpOpen = true
                 }
               }
 
@@ -987,7 +1658,7 @@ ShellRoot {
                       root.pinBottom = false;
                       if (modifiers & Qt.ShiftModifier) root.jumpTo(index, true);
                       else if (modifiers & Qt.ControlModifier) { root.selected = index; root.toggleChecked(index); }
-                      else if (root.selected === index && root.checkedCount === 0) root.viewerOpen = true;
+                      else if (root.selected === index && root.checkedCount === 0) root.openViewer();
                       else root.jumpTo(index, false);
                     }
                   }
@@ -1145,11 +1816,13 @@ ShellRoot {
         item: root.viewerOpen ? root.current : null
         infoOpen: root.infoOpen
         infoRows: (root.current && root.infoForId === root.current.id) ? root.infoRows : []
+        fetching: root.current && root.fetchingId !== "" && root.fetchingId === root.current.id
         onRequestInfo: root.toggleInfo()
         onRequestNext: root.move(1)
         onRequestPrev: root.move(-1)
         onRequestCopyPath: root.copyPath()
         onRequestSave: root.saveToDownloads()
+        onRequestClose: root.viewerOpen = false
       }
 
       // ---- Sign-in ----------------------------------------------------------
@@ -1178,6 +1851,18 @@ ShellRoot {
         items: root.pendingDelete
         onConfirmed: root.confirmDelete()
         onCancelled: root.pendingDelete = null
+      }
+
+      // ---- Date jump --------------------------------------------------------
+      Jump {
+        id: jumpOverlay
+        anchors.fill: parent
+        theme: appTheme
+        visible: root.jumpOpen
+        days: root.dayChoices()
+        onRequestClose: root.jumpOpen = false
+        onPickDay: date => root.pickDay(date)
+        onSubmitDate: text => root.goToDate(text)
       }
 
       // ---- Help -------------------------------------------------------------

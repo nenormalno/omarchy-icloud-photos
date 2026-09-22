@@ -25,10 +25,17 @@ Rectangle {
   // Details panel: rows of [label, value] from the info script.
   property bool infoOpen: false
   property var infoRows: []
+  // Thumbnail is on screen; the original is still downloading.
+  property bool fetching: false
 
   color: theme.darkerBackground
   visible: item !== null
   focus: false
+
+  Keys.onEscapePressed: event => { root.requestClose(); event.accepted = true; }
+  Keys.onPressed: event => {
+    if (event.key === Qt.Key_Backspace) { root.requestClose(); event.accepted = true; }
+  }
 
   onItemChanged: {
     videoShown = item !== null && item.kind === "video";
@@ -103,11 +110,34 @@ Rectangle {
 
   Text {
     anchors.centerIn: still
-    visible: still.status === Image.Loading
+    visible: still.status === Image.Loading && !root.fetching
     text: "…"
     color: theme.darkForeground
     font.family: theme.fontFamily
     font.pixelSize: 28
+  }
+
+  Rectangle {
+    visible: root.fetching && item !== null
+    anchors.centerIn: frame
+    width: 44
+    height: 44
+    radius: 22
+    color: Qt.rgba(0, 0, 0, 0.55)
+    Text {
+      anchors.centerIn: parent
+      text: "\uf110"
+      color: theme.accent
+      font.family: theme.fontFamily
+      font.pixelSize: 18
+      RotationAnimation on rotation {
+        running: root.fetching
+        loops: Animation.Infinite
+        from: 0
+        to: 360
+        duration: 900
+      }
+    }
   }
 
   Video {
@@ -455,6 +485,28 @@ Rectangle {
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: root.requestSave()
+        }
+      }
+
+      Rectangle {
+        anchors.verticalCenter: parent.verticalCenter
+        width: 28; height: 28; radius: 6
+        color: closeArea.containsMouse ? theme.lighterBackground : "transparent"
+        border.color: theme.lighterBackground
+        border.width: 1
+        Text {
+          anchors.centerIn: parent
+          text: ""
+          color: closeArea.containsMouse ? theme.brightForeground : theme.foreground
+          font.family: theme.fontFamily
+          font.pixelSize: 12
+        }
+        MouseArea {
+          id: closeArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.requestClose()
         }
       }
     }

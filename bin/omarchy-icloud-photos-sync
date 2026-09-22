@@ -3,9 +3,11 @@
 # into a local folder and build a thumbnail index for the omarchy-icloud-photos viewer.
 #
 # Safety: icloudpd runs in its default copy mode. This script never passes
-# --auto-delete or --keep-omarchy-icloud-photos-days, so nothing is ever removed from
-# iCloud or from the local library. The library only grows; the viewer simply
-# shows the last DAYS days of it.
+# --auto-delete or --keep-icloud-recent-days, so nothing is ever removed from
+# iCloud or from the local library. New downloads are thumbnails; an original
+# is fetched later, one item at a time, when it is opened. The grid shows the
+# last DAYS days, plus anything from ranges.json: months opened by a date
+# jump, and `since` for weeks loaded by scrolling up.
 #
 # An iCloud Shared Library the account takes part in is pulled as well, into
 # LIBRARY/shared, and its items carry a person mark in the grid.
@@ -37,8 +39,17 @@ SHARED_DIR="$LIBRARY/shared"
 LIBRARIES="$CACHE/libraries.txt"
 INDEX="$CACHE/index.json"
 STATUS="$CACHE/status.json"
+RANGES="$CACHE/ranges.json"
+ASSETS="$CACHE/assets.json"
 LOG="$CACHE/sync.log"
+HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/omarchy-icloud-photos-helper"
 mkdir -p "$LIBRARY" "$THUMBS" "$PREVIEWS" "$VIDEOS"
+
+# Plain lines in sync.log. Runs append; a file past 2MB is rotated once.
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+  mv "$LOG" "$LOG.1"
+fi
 
 write_status() {
   # write_status STATE [MESSAGE] [COUNT]
@@ -51,30 +62,42 @@ write_status() {
 # One run at a time; a second invocation just leaves.
 exec 9>"$CACHE/lock"
 if ! flock -n 9; then
+  log "already running, this invocation is leaving"
   echo "omarchy-icloud-photos-sync: already running" >&2
   exit 0
 fi
 
 skip_download=0
+range_from=""
+range_to=""
 # A demo library (see omarchy-icloud-photos-demo) has nothing to download.
 [ "${DEMO:-0}" = 1 ] && skip_download=1
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --index-only) skip_download=1 ;;
+    --from) range_from="${2:-}"; shift ;;
+    --to) range_to="${2:-}"; shift ;;
     -h|--help)
-      echo "usage: omarchy-icloud-photos-sync [--index-only]"
+      echo "usage: omarchy-icloud-photos-sync [--index-only] [--from YYYY-MM-DD --to YYYY-MM-DD]"
       exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
+  shift
 done
+if [ -n "$range_from" ] || [ -n "$range_to" ]; then
+  [[ "$range_from" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "$range_to" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+    || { echo "need --from and --to as YYYY-MM-DD" >&2; exit 2; }
+  [[ "$range_from" < "$range_to" || "$range_from" == "$range_to" ]] \
+    || { echo "--from is after --to" >&2; exit 2; }
+fi
 
 # --- Build the index -------------------------------------------------------
 # Everything currently on disk within the window becomes index.json. Called
 # repeatedly while icloudpd is still downloading, so the grid fills up as
 # files arrive, and once more at the end.
 #
-# build_index quick  skips the slow SDR conversion of HDR videos (they play
-#                    from the original for now) so the first index is fast
-# build_index        converts what still needs it and rebuilds everything
+# build_index reuses an index row when the file and its thumbnail have not
+# changed. HDR originals are tone-mapped only when their SDR copy is missing.
 build_index() {
   local mode="${1:-full}"
 
@@ -122,89 +145,246 @@ build_index() {
     magick "$1" -auto-orient -resize "${PREVIEW_SIZE}x${PREVIEW_SIZE}>" -quality 90 "$2"
   }
   fresh() { [ -s "$2" ] && [ ! "$1" -nt "$2" ]; }
+  # Stills use -thumb. Live Photo movies cannot: this icloudpd accepts
+  # --live-photo-size thumb in --help, then crashes because the enum value
+  # is "small", which the CLI rejects. medium is the smallest size that runs,
+  # and those files are named *-medium.
+  is_thumb_path() {
+    local stem
+    stem="$(basename "$1")"
+    stem="${stem%.*}"
+    [[ "$stem" == *-thumb || "$stem" == *-medium ]]
+  }
+  strip_size_suffix() {
+    local stem="$1"
+    [[ "$stem" == *-thumb ]] && stem="${stem%-thumb}"
+    [[ "$stem" == *-medium ]] && stem="${stem%-medium}"
+    printf '%s' "$stem"
+  }
 
-  mapfile -d '' files < <(find "$LIBRARY" -type f -newermt "@$cutoff" -print0 | sort -z)
+  local -a pinned=()
+  local history_since="" history_floor=0
+  local range_lo=0 range_hi=0
+  if [ -n "$range_from" ]; then
+    range_lo=$(date -d "$range_from 00:00" +%s)
+    range_hi=$(date -d "$range_to 23:59:59" +%s)
+  fi
+  if [ -f "$RANGES" ]; then
+    mapfile -t pinned < <(jq -r '.months[]? // empty' "$RANGES")
+    history_since=$(jq -r '.since // empty' "$RANGES")
+    if [ -n "$history_since" ]; then
+      history_floor=$(date -d "$history_since 00:00" +%s)
+    fi
+  fi
+  in_scope() {
+    local ts="$1" month m
+    [ "$ts" -ge "$cutoff" ] && return 0
+    [ "$history_floor" -gt 0 ] && [ "$ts" -ge "$history_floor" ] && return 0
+    # The week being pulled is not pinned until the run finishes. Count its
+    # files now so they show up while the download is still going.
+    [ "$range_lo" -gt 0 ] && [ "$ts" -ge "$range_lo" ] && [ "$ts" -le "$range_hi" ] && return 0
+    printf -v month '%(%Y-%m)T' "$ts"
+    for m in "${pinned[@]}"; do
+      [ "$m" = "$month" ] && return 0
+    done
+    return 1
+  }
 
-  declare -A present=()   # basename without extension -> path, for live pairs
+  declare -A cat_record=() cat_library=() cat_name=()
+  if [ -s "$ASSETS" ]; then
+    while IFS=$'\t' read -r ckey crecord clibrary cname; do
+      [ -n "$ckey" ] || continue
+      cat_record["$ckey"]="$crecord"
+      cat_library["$ckey"]="$clibrary"
+      cat_name["$ckey"]="$cname"
+    done < <(jq -r 'to_entries[] | [.key, .value.record, .value.library, .value.filename] | @tsv' "$ASSETS")
+  fi
+
+  declare -A old_ts=() old_path=()
+  if [ -s "$INDEX" ]; then
+    while IFS=$'\t' read -r oid ots opath; do
+      [ -n "$oid" ] || continue
+      old_ts["$oid"]=$ots
+      old_path["$oid"]=$opath
+    done < <(jq -r '.[] | [.id, (.ts|tostring), .path] | @tsv' "$INDEX")
+  fi
+  local -a reuse_ids=()
+  reuse_count=0
+  new_count=0
+  hdr_count=0
+
+  mapfile -d '' files < <(find "$LIBRARY" -type f -print0 | sort -z)
+
+  # Group a still with its -thumb derivative and its _HEVC Live Photo half.
+  # An original wins over a thumb so files already on disk stay the ones shown.
+  local -A slot_image=() slot_video=()
+  local -A seen_key=()
+  local -a keys=()
+  prefer() {
+    local cur="$1" new="$2"
+    if [ -z "$cur" ]; then printf '%s' "$new"; return; fi
+    if is_thumb_path "$cur" && ! is_thumb_path "$new"; then printf '%s' "$new"; return; fi
+    printf '%s' "$cur"
+  }
   for f in "${files[@]}"; do
-    base="${f%.*}"
-    present["$base"]="$f"
+    is_image "$f" || is_video "$f" || continue
+    ts=$(stat -c %Y "$f")
+    in_scope "$ts" || continue
+    dir="$(dirname "$f")"
+    stem="$(strip_size_suffix "$(basename "${f%.*}")")"
+    if is_video "$f" && [[ "$stem" == *_HEVC ]]; then
+      group="img:$dir:${stem%_HEVC}"
+      slot_video["$group"]="$(prefer "${slot_video[$group]:-}" "$f")"
+    elif is_video "$f"; then
+      group="vid:$dir:$stem"
+      slot_video["$group"]="$(prefer "${slot_video[$group]:-}" "$f")"
+    else
+      group="img:$dir:$stem"
+      slot_image["$group"]="$(prefer "${slot_image[$group]:-}" "$f")"
+    fi
+    if [ -z "${seen_key[$group]:-}" ]; then
+      seen_key["$group"]=1
+      keys+=("$group")
+    fi
   done
 
   items=()
   keep=()
   count=0
-  for f in "${files[@]}"; do
-    name="$(basename "$f")"
-    base="${f%.*}"
-    if is_video "$f"; then
-      # A Live Photo's motion half is X_HEVC.MOV next to X.HEIC (or X.JPG).
-      # It belongs to the still, not to the grid.
-      if [[ "$base" == *_HEVC ]]; then
-        still="${base%_HEVC}"
-        if [ -n "${present[$still]:-}" ]; then
-          continue
-        fi
-      fi
+  for group in "${keys[@]}"; do
+    image="${slot_image[$group]:-}"
+    video_file="${slot_video[$group]:-}"
+    [ -n "$image" ] || [ -n "$video_file" ] || continue
+    if [[ "$group" == vid:* ]]; then
       kind=video
-    elif is_image "$f"; then
+      primary="$video_file"
+    elif [ -n "$video_file" ] && [ -n "$image" ]; then
+      kind=live
+      primary="$image"
+    elif [ -n "$image" ]; then
       kind=photo
+      primary="$image"
     else
-      continue
+      kind=video
+      primary="$video_file"
     fi
 
-    key=$(key_for "${f#"$LIBRARY"/}")
+    ts=$(stat -c %Y "$primary")
+    printf -v date '%(%F)T' "$ts"
+    printf -v clock '%(%H:%M)T' "$ts"
+    stem="$(strip_size_suffix "$(basename "${primary%.*}")")"
+    [[ "$stem" == *_HEVC ]] && stem="${stem%_HEVC}"
+    shared=false
+    side=personal
+    if [[ "$primary" == "$SHARED_DIR/"* ]]; then
+      shared=true
+      side=shared
+    fi
+    ckey="${side}|${stem}|${date}"
+    record="${cat_record[$ckey]:-}"
+    library_zone="${cat_library[$ckey]:-}"
+    name="$(basename "$primary")"
+    if [ -n "${cat_name[$ckey]:-}" ] && is_thumb_path "$primary"; then
+      name="${cat_name[$ckey]}"
+    fi
+
+    needs=false
+    if [ "$kind" = video ]; then
+      is_thumb_path "$video_file" && needs=true
+    elif [ "$kind" = live ]; then
+      if is_thumb_path "$image" || is_thumb_path "$video_file"; then needs=true; fi
+    else
+      is_thumb_path "$image" && needs=true
+    fi
+
+    key=$(key_for "$ckey")
     thumb="$THUMBS/$key.jpg"
+    # Unchanged items keep the index row from last time. A week fetch then
+    # only thumbnails the files that just arrived, not the whole gallery.
+    if [ "${old_ts[$key]:-}" = "$ts" ] && [ "${old_path[$key]:-}" = "$primary" ] && [ -s "$thumb" ]; then
+      reuse_ids+=("$key")
+      keep+=("$key")
+      count=$((count + 1))
+      reuse_count=$((reuse_count + 1))
+      continue
+    fi
     preview=""
     video=""
     duration=0
 
-    if [ "$kind" = video ]; then
-      video="$f"
-      if is_hdr "$f"; then
+      if [ "$kind" = video ]; then
+      video="$video_file"
+      # HDR tone-mapping is only for an original that does not already have
+      # an SDR copy. Thumbnails skip it, and a fresh copy is not probed again.
+      if ! is_thumb_path "$video_file"; then
         sdr="$VIDEOS/$key.mp4"
-        if fresh "$f" "$sdr"; then
+        if fresh "$video_file" "$sdr"; then
           video="$sdr"
-        elif [ "$mode" = full ]; then
-          # A fresh SDR copy also means a fresh, correctly coloured thumbnail.
-          if make_sdr "$f" "$sdr"; then video="$sdr"; rm -f "$thumb"; else echo "sdr failed: $f" >&2; fi
+        elif is_hdr "$video_file"; then
+          log "hdr: converting $(basename "$video_file")"
+          write_status indexing "Converting $(basename "$video_file")" "$count"
+          if make_sdr "$video_file" "$sdr"; then
+            video="$sdr"
+            rm -f "$thumb"
+            hdr_count=$((hdr_count + 1))
+          else
+            echo "sdr failed: $video_file" >&2
+          fi
         fi
       fi
-      fresh "$f" "$thumb" || make_video_thumb "$video" "$thumb" || { echo "thumb failed: $f" >&2; continue; }
-      duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | cut -d. -f1)
+      fresh "$video_file" "$thumb" || make_video_thumb "$video" "$thumb" || { echo "thumb failed: $video_file" >&2; continue; }
+      duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video_file" 2>/dev/null | cut -d. -f1)
       duration=${duration:-0}
       preview="$thumb"
+      path="$video_file"
     else
-      fresh "$f" "$thumb" || make_thumb "$f" "$thumb" || { echo "thumb failed: $f" >&2; continue; }
-      if needs_preview "$f"; then
-        preview="$PREVIEWS/$key.jpg"
-        fresh "$f" "$preview" || make_preview "$f" "$preview" || preview="$thumb"
+      fresh "$image" "$thumb" || make_thumb "$image" "$thumb" || { echo "thumb failed: $image" >&2; continue; }
+      if is_thumb_path "$image" || ! needs_preview "$image"; then
+        preview="$image"
       else
-        preview="$f"
+        preview="$PREVIEWS/$key.jpg"
+        fresh "$image" "$preview" || make_preview "$image" "$preview" || preview="$thumb"
       fi
-      live="${present[${base}_HEVC]:-}"
-      if [ -n "$live" ]; then
-        kind=live
-        video="$live"
+      path="$image"
+      if [ "$kind" = live ]; then
+        video="$video_file"
       fi
     fi
 
-    ts=$(stat -c %Y "$f")
-    shared=false
-    [[ "$f" == "$SHARED_DIR/"* ]] && shared=true
     items+=("$(jq -cn \
-      --arg id "$key" --arg path "$f" --arg name "$name" --arg kind "$kind" \
+      --arg id "$key" --arg path "$path" --arg name "$name" --arg kind "$kind" \
       --arg thumb "$thumb" --arg preview "$preview" --arg video "$video" \
+      --arg record "$record" --arg library "$library_zone" \
       --argjson ts "$ts" --argjson duration "${duration:-0}" --argjson shared "$shared" \
-      --arg date "$(date -d "@$ts" +%F)" --arg time "$(date -d "@$ts" +%H:%M)" \
+      --argjson needsOriginal "$needs" \
+      --arg date "$date" --arg time "$clock" \
       '{id: $id, path: $path, name: $name, kind: $kind, thumb: $thumb, preview: $preview,
-        video: $video, ts: $ts, duration: $duration, date: $date, time: $time, shared: $shared}')")
+        video: $video, ts: $ts, duration: $duration, date: $date, time: $time, shared: $shared,
+        needsOriginal: $needsOriginal, record: $record, library: $library}')")
     keep+=("$key")
     count=$((count + 1))
+    new_count=$((new_count + 1))
   done
 
-  # Oldest first: the grid reads like the iPhone Photos app, newest at the bottom.
-  printf '%s\n' "${items[@]}" | jq -s 'sort_by(.ts)' > "$INDEX.tmp"
+  # Oldest first. Unchanged rows are copied from the previous index so a
+  # week does not rebuild thumbnails for the whole gallery.
+  if [ "${#reuse_ids[@]}" -eq 0 ]; then
+    if [ "${#items[@]}" -eq 0 ]; then
+      echo '[]' > "$INDEX.tmp"
+    else
+      printf '%s\n' "${items[@]}" | jq -s 'sort_by(.ts)' > "$INDEX.tmp"
+    fi
+  else
+    if [ "${#items[@]}" -eq 0 ]; then
+      echo '[]' > "$CACHE/index.new.json"
+    else
+      printf '%s\n' "${items[@]}" | jq -s '.' > "$CACHE/index.new.json"
+    fi
+    printf '%s\n' "${reuse_ids[@]}" | jq -R . | jq -s . > "$CACHE/reuse-ids.json"
+    jq --slurpfile fresh "$CACHE/index.new.json" --slurpfile ids "$CACHE/reuse-ids.json" '
+      [.[] | select(.id as $i | ($ids[0] | index($i)) != null)] + $fresh[0] | sort_by(.ts)
+    ' "$INDEX" > "$INDEX.tmp"
+  fi
   mv "$INDEX.tmp" "$INDEX"
 
   # Drop cached thumbnails of items that fell outside the window.
@@ -222,22 +402,43 @@ build_index() {
 # --- Download ---------------------------------------------------------------
 # One icloudpd run per library. The index is rebuilt every 20 seconds while
 # it downloads, so the grid fills up as files arrive.
+# A scrolled week does not use icloudpd: its date flags skip photos but the
+# loop still walks the entire album (the log says "Downloading 17409 ...").
+refresh_index() {
+  # refresh_index LABEL
+  local t0
+  t0=$(date +%s)
+  build_index quick
+  log "index ($1): $count items, ${reuse_count:-0} reused, ${new_count:-0} new, ${hdr_count:-0} hdr, in $(( $(date +%s) - t0 ))s"
+}
+
 download() {
   # download LABEL DIR [icloudpd args…]
   local label="$1" dir="$2"; shift 2
   write_status syncing "Downloading $label" "${count:-0}"
+  if [ -n "$range_from" ]; then
+    pull_range "$label" "$dir" "$@"
+    return
+  fi
   # --skip-created-before gets one extra day so a photo taken late on day
   # DAYS in another time zone is still included; the viewer trims precisely.
   # No --set-exif-datetime: it rewrites files that lack an EXIF date, the
   # size then differs from iCloud's and the next run downloads them again
   # under a "-<size>" suffix. Capture time is taken from mtime instead.
+  # Thumbnails only. --force-size refuses to fall back to the original
+  # when a thumb is missing. The rolling sync keeps the newest-N bound.
+  local -a date_args=(--recent "$RECENT_LIMIT" --skip-created-before "$((DAYS + 1))d")
+  local t0
+  t0=$(date +%s)
+  log "icloudpd $label: newest $RECENT_LIMIT, skip before $((DAYS + 1))d, dir=$dir"
   icloudpd \
     --username "$APPLE_ID" \
     --cookie-directory "$COOKIES" \
     --directory "$dir" \
-    --recent "$RECENT_LIMIT" \
-    --skip-created-before "$((DAYS + 1))d" \
-    --size original \
+    "${date_args[@]}" \
+    --size thumb \
+    --force-size \
+    --live-photo-size medium \
     --folder-structure '{:%Y/%m}' \
     --no-progress-bar \
     --log-level info \
@@ -246,18 +447,55 @@ download() {
   while kill -0 "$dl" 2>/dev/null; do
     for _ in $(seq 1 20); do kill -0 "$dl" 2>/dev/null || break; sleep 1; done
     kill -0 "$dl" 2>/dev/null || break
-    build_index quick
+    refresh_index "$label"
     write_status syncing "Downloading $label" "$count"
   done
   set +e
   wait "$dl"; rc=$?
   set -e
+  log "icloudpd $label finished in $(( $(date +%s) - t0 ))s exit $rc"
   if [ "$rc" != 0 ]; then
     if grep -qiE 'two-factor|2fa|two-step|password|Please enter' "$LOG"; then
       write_status auth-required "iCloud session expired. Run: icloudpd --auth-only --username $APPLE_ID --cookie-directory $COOKIES"
     else
       write_status error "icloudpd failed on $label (exit $rc), see $LOG"
     fi
+    exit "$rc"
+  fi
+}
+
+# Thumbnails for an explicit week. Newest-first, and the walk stops once
+# capture time is older than the week, so scrolling up does not page the
+# whole library. The index is refreshed every couple of seconds.
+pull_range() {
+  local label="$1" dir="$2"; shift 2
+  local zone="PrimarySync"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --library) zone="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local since until t0
+  since=$(date -d "$range_from 00:00" +%s)
+  until=$(date -d "$range_to 23:59:59" +%s)
+  t0=$(date +%s)
+  log "pull $zone $range_from .. $range_to -> $dir"
+  "$HELPER" pull --since "$since" --until "$until" --dest "$dir" \
+    --library "$zone" --merge "$ASSETS" >> "$LOG" 2>&1 &
+  local dl=$!
+  while kill -0 "$dl" 2>/dev/null; do
+    sleep 2
+    kill -0 "$dl" 2>/dev/null || break
+    refresh_index "$label"
+    write_status syncing "Downloading $label" "$count"
+  done
+  set +e
+  wait "$dl"; rc=$?
+  set -e
+  log "pull $zone finished in $(( $(date +%s) - t0 ))s exit $rc"
+  if [ "$rc" != 0 ]; then
+    write_status error "thumbnail fetch failed on $label (exit $rc), see $LOG"
     exit "$rc"
   fi
 }
@@ -284,19 +522,76 @@ shared_libraries() {
   cat "$LIBRARIES"
 }
 
+# Remember what a date jump or an older week asked for, so the next index
+# keeps it. `since` is the earliest day requested; months cover a jump.
+pin_range() {
+  local start end d add
+  local -a months=()
+  start=$(date -d "$range_from" +%Y-%m-01)
+  end=$(date -d "$range_to" +%Y-%m-01)
+  d="$start"
+  while [[ ! "$d" > "$end" ]]; do
+    months+=("${d:0:7}")
+    d=$(date -d "$d + 1 month" +%Y-%m-01)
+  done
+  add=$(printf '%s\n' "${months[@]}" | jq -R . | jq -s .)
+  if [ -f "$RANGES" ]; then
+    jq --argjson add "$add" --arg since "$range_from" '
+      .months = ((.months // []) + $add | unique)
+      | .since = (if (.since // "") == "" or $since < .since then $since else .since end)
+    ' "$RANGES" > "$RANGES.tmp"
+  else
+    jq -n --argjson add "$add" --arg since "$range_from" '{months: $add, since: $since}' > "$RANGES.tmp"
+  fi
+  mv "$RANGES.tmp" "$RANGES"
+}
+
+# Record iCloud ids for the window we just cared about. A failure here still
+# leaves the files on disk; opening an item without an id asks for a sync.
+catalog_assets() {
+  local since until
+  local -a zones=(PrimarySync)
+  if [ -n "$range_from" ]; then
+    since=$(date -d "$range_from 00:00" +%s)
+    until=$(date -d "$range_to 23:59:59" +%s)
+  else
+    since=$(date -d "-$DAYS days 00:00" +%s)
+    until=$(date +%s)
+  fi
+  if [ -s "$LIBRARIES" ]; then
+    while read -r zone; do
+      [ -n "$zone" ] || continue
+      zones+=("$zone")
+    done < "$LIBRARIES"
+  fi
+  local -a cmd=("$HELPER" catalog --since "$since" --until "$until" --merge "$ASSETS")
+  local zone
+  for zone in "${zones[@]}"; do
+    cmd+=(--zone "$zone")
+  done
+  "${cmd[@]}"
+}
+
 if [ "$skip_download" = 0 ]; then
-  : > "$LOG"
+  log "---- sync from=${range_from:-rolling} to=${range_to:-} days=$DAYS ----"
   download "from iCloud" "$LIBRARY"
   while read -r zone; do
     [ -n "$zone" ] || continue
     download "the shared library" "$SHARED_DIR" --library "$zone"
   done < <(shared_libraries)
+  if [ -n "$range_from" ]; then
+    pin_range
+  fi
+  if [ "${DEMO:-0}" != 1 ] && [ -z "$range_from" ]; then
+    catalog_assets || log "catalog failed, see helper.log"
+  fi
 fi
 
-# Quick pass first so the grid is complete right away, then the HDR videos.
-write_status indexing "Building thumbnails"
-build_index quick
-write_status indexing "Converting HDR videos" "$count"
-build_index
+# One index at the end. It reuses rows whose file has not changed, and it
+# tone-maps an HDR original only when that copy is missing. A week of
+# thumbnails does not rebuild or re-probe the rest of the gallery.
+write_status indexing "Updating the grid" "${count:-0}"
+refresh_index "done"
 write_status ok "" "$count"
+log "sync finished: $count items"
 echo "omarchy-icloud-photos-sync: $count items in the last $DAYS days"

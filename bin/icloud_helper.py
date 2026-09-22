@@ -3,7 +3,9 @@
 
     icloud_helper.py login   --username APPLE_ID [--save-config]
     icloud_helper.py find    --file PATH --ts EPOCH [--shared]
-    icloud_helper.py delete  --key KEY --file PATH --ts EPOCH [--companion PATH] [--shared]
+    icloud_helper.py catalog --since EPOCH --until EPOCH --merge FILE [--zone ZONE ...]
+    icloud_helper.py fetch   --record ID --dest DIR [--library ZONE] [--ts EPOCH]
+    icloud_helper.py delete  --key KEY --file PATH --ts EPOCH [--companion PATH] [--shared] [--record ID] [--library ZONE]
     icloud_helper.py restore --key KEY
 
 `--shared` looks in the iCloud Shared Library the account is in instead of
@@ -30,6 +32,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -40,6 +43,7 @@ from pyicloud_ipd.exceptions import (
     PyiCloudFailedLoginException,
     PyiCloudServiceUnavailableException,
 )
+from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-icloud-photos" / "config"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-icloud-photos"
@@ -131,6 +135,33 @@ def locate(api, name, ts, shared):
         if asset is not None:
             return zone, library, asset
     fail("asset not found in the newest items of the " + ("shared" if shared else "personal") + " library")
+
+
+def find_by_record(library, record, ts=None):
+    """Newest-first walk until this master record. When ts is known, stop once
+    capture time is more than a day older: the album is ordered newest first."""
+    floor = (ts - 86400) if ts else None
+    for asset in library.all:
+        if asset.id == record:
+            return asset
+        if floor is not None and asset.created.timestamp() < floor:
+            break
+    return None
+
+
+def locate_record(api, record, ts, library_name, shared):
+    """The asset with this master record id."""
+    if library_name:
+        library = library_by_zone(api, library_name)
+        asset = find_by_record(library, record, ts)
+        if asset is None:
+            fail("asset not found")
+        return library_name, library, asset
+    for zone, library in libraries(api, shared):
+        asset = find_by_record(library, record, ts)
+        if asset is not None:
+            return zone, library, asset
+    fail("asset not found")
 
 
 def library_by_zone(api, zone):
@@ -245,7 +276,10 @@ def cmd_delete(args, cfg):
         zone, new_tag = ("demo-shared" if args.shared else "PrimarySync"), ""
     else:
         api = connect(cfg)
-        zone, library, asset = locate(api, os.path.basename(args.file), args.ts, args.shared)
+        if args.record:
+            zone, library, asset = locate_record(api, args.record, args.ts, args.library, args.shared)
+        else:
+            zone, library, asset = locate(api, os.path.basename(args.file), args.ts, args.shared)
         info = describe(asset)
         new_tag = set_deleted(library, info["record"], info["changeTag"], True)
 
@@ -291,6 +325,238 @@ def cmd_restore(args, cfg):
     print(json.dumps({"ok": True, "key": args.key, "record": manifest["record"], "filename": manifest["filename"]}))
 
 
+def cmd_catalog(args, cfg):
+    """Remember master-record ids for assets captured in [since, until].
+
+    Newest-first, and the walk stops once capture time is older than the
+    window, so a recent month does not page the whole library. Merged into
+    the existing map so a later jump does not forget the rolling window.
+    """
+    path = Path(args.merge)
+    current = {}
+    if path.exists():
+        try:
+            current = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            current = {}
+    if demo(cfg):
+        emit({"ok": True, "count": 0})
+        return
+    api = connect(cfg)
+    zones = args.zone or ["PrimarySync"]
+    found = {}
+    for zone in zones:
+        library = library_by_zone(api, zone)
+        side = "shared" if zone != "PrimarySync" else "personal"
+        for asset in library.all:
+            ts = asset.created.timestamp()
+            if ts > args.until + 86400:
+                continue
+            if ts < args.since - 86400:
+                break
+            stem = Path(asset.filename).stem
+            day = asset.created.date().isoformat()
+            found[f"{side}|{stem}|{day}"] = {
+                "record": asset.id,
+                "library": zone,
+                "filename": asset.filename,
+                "ts": int(ts),
+            }
+    current.update(found)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(current))
+    os.chmod(path, 0o600)
+    emit({"ok": True, "count": len(found)})
+
+
+def _save_response(resp, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        with tmp.open("wb") as fh:
+            for chunk in resp.iter_content(256 * 1024):
+                if chunk:
+                    fh.write(chunk)
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o600)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _version_path(folder: Path, asset, version, size) -> Path:
+    """Same names icloudpd writes: stills get -thumb, live movies get -medium."""
+    from icloudpd.base import lp_filename_concatinator
+    from pyicloud_ipd.asset_version import add_suffix_to_filename, calculate_version_filename
+    from pyicloud_ipd.utils import size_to_suffix
+    from pyicloud_ipd.version_size import AssetVersionSize
+
+    name = calculate_version_filename(
+        asset.filename, version, size, lp_filename_concatinator, asset.item_type,
+    )
+    # LivePhotoVersionSize is not in the still-photo suffix table, so the
+    # medium movie suffix is added the same way icloudpd does.
+    if not isinstance(size, AssetVersionSize):
+        name = add_suffix_to_filename(size_to_suffix(size), name)
+    return folder / name
+
+
+def _download_version(library, asset, version, dest: Path, ts: int):
+    if dest.is_file() and dest.stat().st_size > 0:
+        return False
+    _save_response(asset.download(library.session, version.url), dest)
+    os.utime(dest, (ts, ts))
+    return True
+
+
+def note(msg: str) -> None:
+    """One readable line in helper.log and on stdout (the sync log)."""
+    logging.getLogger().info("%s", msg)
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def cmd_pull(args, cfg):
+    """Download thumbnails for [since, until] and stop once photos are older.
+
+    icloudpd's date flags skip items but still walk the whole album. A week
+    near the top of a 17k library then spends minutes paging everything older
+    than that week. This walk is newest-first and breaks at the floor.
+    """
+    if demo(cfg):
+        emit({"ok": True, "count": 0})
+        return
+    from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
+
+    api = connect(cfg)
+    library = library_by_zone(api, args.library or "PrimarySync")
+    dest_root = Path(args.dest)
+    zone = args.library or "PrimarySync"
+    side = "shared" if zone != "PrimarySync" else "personal"
+    path = Path(args.merge) if args.merge else None
+    current = {}
+    if path is not None and path.exists():
+        try:
+            current = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            current = {}
+    found = {}
+    count = 0
+    walked = 0
+    skipped_newer = 0
+    errors = 0
+    missing_thumb = 0
+    reason = "end of library"
+    started = time.monotonic()
+    last_note = started
+    last_day = ""
+    window = time.strftime("%Y-%m-%d", time.localtime(args.since))
+    until_day = time.strftime("%Y-%m-%d", time.localtime(args.until))
+    note(f"pull {zone} {window} .. {until_day}: signed in, walking newest first")
+
+    def progress(force: bool = False) -> None:
+        nonlocal last_note
+        now = time.monotonic()
+        if not force and walked % 200 != 0 and now - last_note < 5:
+            return
+        last_note = now
+        note(
+            f"pull {zone}: walked {walked}, skipped {skipped_newer} newer, "
+            f"downloaded {count}, errors {errors}, at {last_day or '?'}"
+        )
+
+    for asset in library.all:
+        walked += 1
+        ts = int(asset.created.timestamp())
+        last_day = asset.created.astimezone().strftime("%Y-%m-%d")
+        if ts > args.until + 86400:
+            skipped_newer += 1
+            progress()
+            continue
+        if ts < args.since - 86400:
+            reason = f"older than {window}"
+            break
+        folder = dest_root / asset.created.astimezone().strftime("%Y/%m")
+        versions = asset.versions
+        thumb = versions.get(AssetVersionSize.THUMB)
+        if thumb is None:
+            missing_thumb += 1
+            note(f"pull skip {asset.filename}: no thumbnail")
+            continue
+        try:
+            still = _version_path(folder, asset, thumb, AssetVersionSize.THUMB)
+            if _download_version(library, asset, thumb, still, ts):
+                count += 1
+                note(f"downloaded {still.name}")
+            live = versions.get(LivePhotoVersionSize.MEDIUM)
+            if live is not None:
+                movie = _version_path(folder, asset, live, LivePhotoVersionSize.MEDIUM)
+                if _download_version(library, asset, live, movie, ts):
+                    note(f"downloaded {movie.name}")
+        except Exception as exc:
+            errors += 1
+            note(f"pull error {asset.filename}: {exc}")
+            continue
+        day = asset.created.date().isoformat()
+        found[f"{side}|{Path(asset.filename).stem}|{day}"] = {
+            "record": asset.id,
+            "library": zone,
+            "filename": asset.filename,
+            "ts": ts,
+        }
+        progress()
+    if path is not None:
+        current.update(found)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(current))
+        os.chmod(path, 0o600)
+    elapsed = time.monotonic() - started
+    note(
+        f"pull done ({reason}): walked {walked}, skipped {skipped_newer} newer, "
+        f"downloaded {count}, catalog {len(found)}, missing thumb {missing_thumb}, "
+        f"errors {errors}, {elapsed:.0f}s"
+    )
+    emit({"ok": True, "count": count, "catalog": len(found), "walked": walked, "errors": errors})
+
+
+def cmd_fetch(args, cfg):
+    """Download one original (and its Live Photo companion) into --dest."""
+    if demo(cfg):
+        fail("demo library does not download from iCloud")
+    started = time.monotonic()
+    note(f"fetch library={args.library or 'PrimarySync'} ts={args.ts or 0}")
+    api = connect(cfg)
+    zone, library, asset = locate_record(api, args.record, args.ts or None, args.library, False)
+    versions = asset.versions
+    original = versions.get(AssetVersionSize.ORIGINAL)
+    if original is None:
+        fail("no original for this item")
+    dest_dir = Path(args.dest)
+    ts = int(asset.created.timestamp())
+    written = []
+
+    still = dest_dir / asset.filename
+    if not still.is_file() or still.stat().st_size == 0:
+        _save_response(asset.download(library.session, original.url), still)
+        os.utime(still, (ts, ts))
+    written.append(str(still))
+
+    live = versions.get(LivePhotoVersionSize.ORIGINAL)
+    if live is not None:
+        from icloudpd.base import lp_filename_concatinator
+        from pyicloud_ipd.asset_version import calculate_version_filename
+        live_name = calculate_version_filename(
+            asset.filename, live, LivePhotoVersionSize.ORIGINAL,
+            lp_filename_concatinator, asset.item_type,
+        )
+        live_path = dest_dir / live_name
+        if not live_path.is_file() or live_path.stat().st_size == 0:
+            _save_response(asset.download(library.session, live.url), live_path)
+            os.utime(live_path, (ts, ts))
+        written.append(str(live_path))
+    note(f"fetch done {asset.filename}: {len(written)} file(s) in {time.monotonic() - started:.1f}s")
+    emit({"ok": True, "record": asset.id, "library": zone, "files": written})
+
+
 def main():
     # Everything pyicloud says goes to <cache>/helper.log so a failed sign-in
     # can be understood afterwards. Passwords are masked by pyicloud itself.
@@ -304,12 +570,30 @@ def main():
     l = sub.add_parser("login"); l.add_argument("--username", required=True); l.add_argument("--save-config", action="store_true")
     f = sub.add_parser("find"); f.add_argument("--file", required=True); f.add_argument("--ts", type=int, required=True)
     f.add_argument("--shared", action="store_true")
+    c = sub.add_parser("catalog")
+    c.add_argument("--since", type=int, required=True)
+    c.add_argument("--until", type=int, required=True)
+    c.add_argument("--merge", required=True)
+    c.add_argument("--zone", action="append")
+    u = sub.add_parser("pull")
+    u.add_argument("--since", type=int, required=True)
+    u.add_argument("--until", type=int, required=True)
+    u.add_argument("--dest", required=True)
+    u.add_argument("--library", default="")
+    u.add_argument("--merge", default="")
+    g = sub.add_parser("fetch")
+    g.add_argument("--record", required=True)
+    g.add_argument("--dest", required=True)
+    g.add_argument("--library", default="")
+    g.add_argument("--ts", type=int, default=0)
     d = sub.add_parser("delete"); d.add_argument("--key", required=True); d.add_argument("--file", required=True)
     d.add_argument("--ts", type=int, required=True); d.add_argument("--companion"); d.add_argument("--shared", action="store_true")
+    d.add_argument("--record", default=""); d.add_argument("--library", default="")
     r = sub.add_parser("restore"); r.add_argument("--key", required=True)
     args = p.parse_args()
     cfg = read_config(require_id=args.cmd != "login")
-    {"login": cmd_login, "find": cmd_find, "delete": cmd_delete, "restore": cmd_restore}[args.cmd](args, cfg)
+    {"login": cmd_login, "find": cmd_find, "catalog": cmd_catalog, "pull": cmd_pull,
+     "fetch": cmd_fetch, "delete": cmd_delete, "restore": cmd_restore}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

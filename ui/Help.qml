@@ -12,14 +12,19 @@ Rectangle {
   readonly property var sections: [
     { title: "Grid", keys: [
       ["h j k l  arrows", "move"],
+      ["pgup  pgdn", "a page up, a page down"],
+      ["scroll up", "load the previous week"],
       ["shift + move", "select a range"],
       ["ctrl + click", "add or remove one"],
       ["x  ctrl + space", "tick the one under the cursor"],
       ["ctrl + a", "select everything"],
-      ["esc", "clear the selection, or quit"],
+      ["esc", "clear the selection, or the date filter"],
       ["enter  space", "open the viewer"],
       ["g  G", "oldest, newest"],
+      ["/", "filter to a date"],
+      ["day heading", "open the date list"],
       ["-  +", "smaller, larger thumbnails"],
+      ["ctrl + wheel", "smaller, larger thumbnails"],
       ["r", "sync now"],
       ["q", "quit"]
     ]},
